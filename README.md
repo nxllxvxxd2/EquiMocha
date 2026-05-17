@@ -22,7 +22,7 @@ Okay this is a different type of install.
 7. Run `pnpm build`
 8. Run `pnpm inject`
 9. Follow the installation prompts
-10. Reboot and the plugin should be under your plugins list in the settings menu
+10. Restart Discord and the plugin should be under your plugins list in the settings menu
 
 
 ## The Basics
