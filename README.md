@@ -8,7 +8,7 @@
 # INSTRUCTIONS (PLEASE READ)
 Requirements:
 - [NodeJS 18 or higher](https://nodejs.org/en/download)
-- [Git](https://git-scm.com/downloads) (optional, but recommended for easier updates)
+- [Git](https://git-scm.com/downloads)
 
 Okay this is a different type of install.
 1. Clone the Equicord repo `git clone https://github.com/Equicord/Equicord`
