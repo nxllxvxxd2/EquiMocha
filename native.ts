@@ -35,6 +35,13 @@ type ExistingShareMatch = {
     token: string;
 };
 
+type ExistingMochaFile = {
+    id: string;
+    name: string;
+    size: number;
+    mimeType: string;
+};
+
 const activeUploads = new Map<string, NativeUploadSession>();
 
 function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
@@ -42,7 +49,22 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
 }
 
 function today(): string {
-    return new Date().toISOString().split("T")[0];
+    return formatLocalDate(0);
+}
+
+function formatLocalDate(offsetDays: number): string {
+    const date = new Date();
+    date.setDate(date.getDate() + offsetDays);
+
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, "0");
+    const day = String(date.getDate()).padStart(2, "0");
+
+    return `${year}-${month}-${day}`;
+}
+
+function getCandidateUploadFolders(): string[] {
+    return [-1, 0, 1].map(offset => `/discord/${formatLocalDate(offset)}`);
 }
 
 function authHeaders(apiKey: string, extra: Record<string, string> = {}) {
@@ -156,12 +178,50 @@ function getFileId(data: any): string {
     return String(fileId);
 }
 
+function getListedFileId(file: any): string {
+    return String(file?.id ?? file?.fileId ?? file?.file_id ?? file?.uuid ?? "");
+}
+
+function getListedFileName(file: any): string {
+    return String(
+        file?.originalName
+        ?? file?.original_name
+        ?? file?.name
+        ?? file?.fileName
+        ?? file?.file_name
+        ?? ""
+    );
+}
+
+function getListedFileSize(file: any): number | null {
+    return coerceSize(
+        file?.fileSize
+        ?? file?.file_size
+        ?? file?.size
+        ?? file?.bytes
+    );
+}
+
+function getListedFileMimeType(file: any): string {
+    return String(
+        file?.mimeType
+        ?? file?.mime_type
+        ?? file?.contentType
+        ?? file?.content_type
+        ?? ""
+    );
+}
+
 function normalizeFileName(value: unknown): string {
     return typeof value === "string" ? value.trim().toLowerCase() : "";
 }
 
 function normalizeMimeType(value: unknown): string {
     return typeof value === "string" ? value.trim().toLowerCase() : "";
+}
+
+function isGenericMimeType(value: string): boolean {
+    return !value || value === "application/octet-stream";
 }
 
 function coerceSize(value: unknown): number | null {
@@ -221,9 +281,60 @@ function shareMatchesFile(share: any, filename: string, size: number, mimeType: 
 
     const shareMime = normalizeMimeType(getShareMimeType(share));
     const fileMime = normalizeMimeType(mimeType);
-    if (shareMime && fileMime && shareMime !== fileMime) return false;
+    if (shareMime && !isGenericMimeType(fileMime) && shareMime !== fileMime) return false;
 
     return Boolean(shareName) && shareSize === size;
+}
+
+function listedFileMatches(file: any, filename: string, size: number, mimeType: string): boolean {
+    const fileId = getListedFileId(file);
+    if (!fileId) return false;
+
+    const listedName = normalizeFileName(getListedFileName(file));
+    if (listedName && listedName !== normalizeFileName(filename)) return false;
+
+    const listedSize = getListedFileSize(file);
+    if (listedSize !== size) return false;
+
+    const listedMime = normalizeMimeType(getListedFileMimeType(file));
+    const targetMime = normalizeMimeType(mimeType);
+    if (listedMime && !isGenericMimeType(targetMime) && listedMime !== targetMime) return false;
+
+    return Boolean(listedName);
+}
+
+async function listFilesInFolder(apiKey: string, folderPath: string): Promise<any[]> {
+    const url = new URL(`${MOCHA_BASE}/api/files`);
+    url.searchParams.set("path", folderPath);
+    url.searchParams.set("includeSubfolders", "1");
+
+    const response = await fetchWithTimeout(url.toString(), {
+        method: "GET",
+        headers: authHeaders(apiKey)
+    }, 30 * 1000);
+
+    if (!response.ok) return [];
+
+    const data = await response.json().catch(() => null);
+    return Array.isArray(data?.files) ? data.files : [];
+}
+
+async function findExistingMochaFile(apiKey: string, filename: string, size: number, mimeType: string): Promise<ExistingMochaFile | null> {
+    for (const folder of getCandidateUploadFolders()) {
+        const files = await listFilesInFolder(apiKey, folder).catch(() => []);
+        const match = files.find(file => listedFileMatches(file, filename, size, mimeType));
+
+        if (!match) continue;
+
+        return {
+            id: getListedFileId(match),
+            name: getListedFileName(match),
+            size: getListedFileSize(match) ?? size,
+            mimeType: getListedFileMimeType(match) || mimeType
+        };
+    }
+
+    return null;
 }
 
 async function findExistingShare(apiKey: string, filename: string, size: number, mimeType: string): Promise<ExistingShareMatch | null> {
@@ -278,6 +389,30 @@ async function findExistingShare(apiKey: string, filename: string, size: number,
     }
 
     return null;
+}
+
+async function getExistingShareOrCreateForFile(
+    apiKey: string,
+    file: ExistingMochaFile,
+    requestedFilename: string,
+    requestedSize: number,
+    requestedMimeType: string,
+    shareExpiry: string
+): Promise<ExistingShareMatch> {
+    const existingShare = await findExistingShare(apiKey, requestedFilename, requestedSize, requestedMimeType).catch(() => null);
+    if (existingShare) return existingShare;
+
+    return {
+        token: "",
+        url: await createShare(apiKey, file.id, shareExpiry)
+    };
+}
+
+async function findExistingMochaShareOrCreate(apiKey: string, filename: string, size: number, mimeType: string, shareExpiry: string): Promise<ExistingShareMatch | null> {
+    const existingFile = await findExistingMochaFile(apiKey, filename, size, mimeType);
+    if (!existingFile) return null;
+
+    return getExistingShareOrCreateForFile(apiKey, existingFile, filename, size, mimeType, shareExpiry);
 }
 
 async function uploadDirect(
@@ -732,7 +867,7 @@ export async function uploadToMocha(
             status: "Checking Mocha for an existing share..."
         });
 
-        const existingShare = await findExistingShare(apiKey, filename, fileBuffer.byteLength, resolvedMimeType).catch(() => null);
+        const existingShare = await findExistingMochaShareOrCreate(apiKey, filename, fileBuffer.byteLength, resolvedMimeType, shareExpiry).catch(() => null);
         if (existingShare) {
             setProgress(uploadKey, {
                 phase: "success",
@@ -817,7 +952,7 @@ export async function uploadPathToMocha(
             status: "Checking Mocha for an existing share..."
         });
 
-        const existingShare = await findExistingShare(apiKey, filename, fileStat.size, resolvedMimeType).catch(() => null);
+        const existingShare = await findExistingMochaShareOrCreate(apiKey, filename, fileStat.size, resolvedMimeType, shareExpiry).catch(() => null);
         if (existingShare) {
             setProgress(uploadKey, {
                 phase: "success",
