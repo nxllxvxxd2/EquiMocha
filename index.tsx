@@ -12,7 +12,6 @@ import { OpenExternalIcon } from "@components/Icons";
 import { classNameFactory } from "@utils/css";
 import { sendMessage } from "@utils/discord";
 import definePlugin, { OptionType, PluginNative } from "@utils/types";
-import { chooseFile } from "@utils/web";
 import { findByPropsLazy } from "@webpack";
 import { DraftType, FluxDispatcher, Menu, PermissionsBits, PermissionStore, React, SelectedChannelStore, showToast, Toasts, useEffect, UserStore, useState } from "@webpack/common";
 
@@ -33,6 +32,7 @@ let uploadAddFilesInterceptor: ((event: unknown) => void) | null = null;
 let pasteEventListener: ((event: ClipboardEvent) => void) | null = null;
 let dragOverEventListener: ((event: DragEvent) => void) | null = null;
 let dropEventListener: ((event: DragEvent) => void) | null = null;
+let fileInputChangeEventListener: ((event: Event) => void) | null = null;
 
 type UploadAddFilesEvent = {
     type: string;
@@ -350,6 +350,24 @@ function handleDrop(event: DragEvent) {
     })) return;
 
     stopDiscordFileEvent(event);
+    void uploadProvidedFiles(files);
+}
+
+function handleFileInputChange(event: Event) {
+    const input = event.target;
+    if (!(input instanceof HTMLInputElement) || input.type !== "file") return;
+
+    const files = Array.from(input.files || []);
+    if (!files.length) return;
+
+    if (!settings.store.bypassDiscordUpload || !isConfigured()) return;
+    if (!shouldInterceptUploadFiles(files, {
+        type: "FILE_INPUT",
+        draftType: DraftType.ChannelMessage
+    })) return;
+
+    stopDiscordFileEvent(event);
+    input.value = "";
     void uploadProvidedFiles(files);
 }
 
@@ -827,6 +845,51 @@ async function uploadToMocha(fileBlob: Blob, filename: string): Promise<string> 
     throw new Error("EquiMocha requires the Discord desktop native helper because Mocha blocks browser CORS requests.");
 }
 
+async function uploadPathToMocha(filePath: string, filename: string, mimeType = "application/octet-stream"): Promise<string> {
+    if (!Native) {
+        throw new Error("EquiMocha requires the Discord desktop native helper because Mocha blocks browser CORS requests.");
+    }
+
+    const uploadKey = createUploadKey();
+    activeNativeUploadKey = uploadKey;
+    const progressTimer = setInterval(() => {
+        void Native.getUploadProgress(uploadKey)
+            .then(progress => {
+                if (activeNativeUploadKey === uploadKey) {
+                    applyNativeProgress(progress);
+                }
+            })
+            .catch(error => debugLog("native progress poll failed", error));
+    }, 250);
+
+    try {
+        const result = await Native.uploadPathToMocha(
+            filePath,
+            filename,
+            mimeType,
+            settings.store.apiKey.trim(),
+            settings.store.shareExpiry,
+            uploadKey
+        );
+
+        const finalProgress = await Native.getUploadProgress(uploadKey).catch(() => null);
+        applyNativeProgress(finalProgress);
+
+        debugLog("native path upload result", result);
+
+        if (!result.success || !result.url) {
+            throw new Error(result.error || "Native Mocha upload failed");
+        }
+
+        return result.url;
+    } finally {
+        clearInterval(progressTimer);
+        if (activeNativeUploadKey === uploadKey) {
+            activeNativeUploadKey = null;
+        }
+    }
+}
+
 async function uploadToMochaRenderer(fileBlob: Blob, filename: string): Promise<string> {
     const destinationFolder = `/discord/${today()}`;
 
@@ -938,10 +1001,67 @@ async function uploadFile(url: string): Promise<void> {
 }
 
 async function uploadPickedFile(): Promise<void> {
-    const file = await chooseFile("*/*");
-    if (!file) return;
+    if (!Native) {
+        showToast("EquiMocha file selection requires Discord desktop", Toasts.Type.FAILURE);
+        return;
+    }
 
-    await uploadProvidedFiles([file]);
+    if (isUploading) {
+        showToast("Upload already in progress", Toasts.Type.MESSAGE);
+        return;
+    }
+
+    if (!isConfigured()) {
+        showToast("Please configure EquiMocha settings first", Toasts.Type.FAILURE);
+        return;
+    }
+
+    const selectedFile = await Native.chooseFilePath();
+    if (!selectedFile) return;
+
+    isUploading = true;
+    cancelRequested = false;
+
+    setUploadState({
+        phase: "preparing",
+        fileName: selectedFile.name,
+        currentServiceLabel: MOCHA_SERVICE_LABEL,
+        attempt: 0,
+        totalAttempts: 0,
+        percent: 2,
+        transferredBytes: 0,
+        totalBytes: 0,
+        status: `Preparing ${selectedFile.name}...`,
+        canCancel: true
+    });
+
+    try {
+        const uploadedUrl = await uploadPathToMocha(selectedFile.path, selectedFile.name);
+
+        setUploadState({
+            phase: "success",
+            percent: 100,
+            status: `Uploaded successfully via ${MOCHA_SERVICE_LABEL}.`,
+            canCancel: false
+        });
+
+        await notifyUploadSuccess(uploadedUrl);
+    } catch (error) {
+        const message = error instanceof Error ? error.message : "Unknown error";
+        if (isUploadCancelledError(error)) {
+            showToast("Upload cancelled", Toasts.Type.MESSAGE);
+            setUploadState({ phase: "cancelled", status: "Upload cancelled.", canCancel: false, percent: 0 });
+        } else {
+            showToast(`Upload failed: ${message}`, Toasts.Type.FAILURE);
+            console.error("[EquiMocha]", error);
+            setUploadState({ phase: "failed", status: `Upload failed: ${message}`, canCancel: false, percent: 0 });
+        }
+    } finally {
+        isUploading = false;
+        activeAbortController = null;
+        activeXhr = null;
+        setTimeout(() => resetUploadState(), 1800);
+    }
 }
 
 async function uploadProvidedFiles(files: readonly File[]): Promise<void> {
@@ -1186,6 +1306,9 @@ export default definePlugin({
         dropEventListener = event => handleDrop(event);
         document.addEventListener("dragover", dragOverEventListener, true);
         document.addEventListener("drop", dropEventListener, true);
+
+        fileInputChangeEventListener = event => handleFileInputChange(event);
+        document.addEventListener("change", fileInputChangeEventListener, true);
     },
     stop() {
         if (!uploadAddFilesInterceptor) {
@@ -1212,6 +1335,11 @@ export default definePlugin({
         if (dropEventListener) {
             document.removeEventListener("drop", dropEventListener, true);
             dropEventListener = null;
+        }
+
+        if (fileInputChangeEventListener) {
+            document.removeEventListener("change", fileInputChangeEventListener, true);
+            fileInputChangeEventListener = null;
         }
     },
     shouldBypassDiscordUploadSizeCheck(): boolean {

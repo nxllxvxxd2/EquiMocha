@@ -1,4 +1,4 @@
-import { IpcMainInvokeEvent } from "electron";
+import { dialog, IpcMainInvokeEvent } from "electron";
 import { open, readFile, stat } from "fs/promises";
 
 const MOCHA_BASE = "https://mocha.my";
@@ -28,6 +28,11 @@ type NativeUploadSession = {
     progress: NativeUploadProgress;
     controller: AbortController;
     cancelled: boolean;
+};
+
+type ExistingShareMatch = {
+    url: string;
+    token: string;
 };
 
 const activeUploads = new Map<string, NativeUploadSession>();
@@ -149,6 +154,130 @@ function getFileId(data: any): string {
     }
 
     return String(fileId);
+}
+
+function normalizeFileName(value: unknown): string {
+    return typeof value === "string" ? value.trim().toLowerCase() : "";
+}
+
+function normalizeMimeType(value: unknown): string {
+    return typeof value === "string" ? value.trim().toLowerCase() : "";
+}
+
+function coerceSize(value: unknown): number | null {
+    if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
+    if (typeof value === "string") {
+        const parsed = Number(value);
+        return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+    }
+
+    return null;
+}
+
+function getShareToken(share: any): string {
+    return String(share?.token ?? share?.shareToken ?? share?.id ?? "");
+}
+
+function getShareFileName(share: any): string {
+    return String(
+        share?.originalName
+        ?? share?.original_name
+        ?? share?.fileName
+        ?? share?.file_name
+        ?? share?.name
+        ?? ""
+    );
+}
+
+function getShareSize(share: any): number | null {
+    return coerceSize(
+        share?.fileSize
+        ?? share?.file_size
+        ?? share?.size
+        ?? share?.bytes
+    );
+}
+
+function getShareMimeType(share: any): string {
+    return String(
+        share?.mimeType
+        ?? share?.mime_type
+        ?? share?.contentType
+        ?? share?.content_type
+        ?? ""
+    );
+}
+
+function isShareActive(share: any): boolean {
+    return share?.is_active ?? share?.isActive ?? true;
+}
+
+function shareMatchesFile(share: any, filename: string, size: number, mimeType: string): boolean {
+    const shareName = normalizeFileName(getShareFileName(share));
+    if (shareName && shareName !== normalizeFileName(filename)) return false;
+
+    const shareSize = getShareSize(share);
+    if (shareSize !== null && shareSize !== size) return false;
+
+    const shareMime = normalizeMimeType(getShareMimeType(share));
+    const fileMime = normalizeMimeType(mimeType);
+    if (shareMime && fileMime && shareMime !== fileMime) return false;
+
+    return Boolean(shareName) && shareSize === size;
+}
+
+async function findExistingShare(apiKey: string, filename: string, size: number, mimeType: string): Promise<ExistingShareMatch | null> {
+    const sharesResponse = await fetchWithTimeout(`${MOCHA_BASE}/api/shares`, {
+        method: "GET",
+        headers: authHeaders(apiKey)
+    }, 30 * 1000);
+
+    if (!sharesResponse.ok) {
+        return null;
+    }
+
+    const sharesData = await sharesResponse.json();
+    const shares = Array.isArray(sharesData) ? sharesData : sharesData?.shares;
+    if (!Array.isArray(shares)) return null;
+
+    const targetName = normalizeFileName(filename);
+    const likelyShares = shares.filter((share: any) => {
+        if (!isShareActive(share)) return false;
+
+        const token = getShareToken(share);
+        if (!token) return false;
+
+        if (shareMatchesFile(share, filename, size, mimeType)) return true;
+
+        const listedName = normalizeFileName(getShareFileName(share));
+        const listedSize = getShareSize(share);
+
+        return !listedName || listedName === targetName || listedSize === size;
+    });
+
+    for (const share of likelyShares) {
+        const token = getShareToken(share);
+        if (!token) continue;
+
+        if (shareMatchesFile(share, filename, size, mimeType)) {
+            return { token, url: `${MOCHA_BASE}/share/${token}` };
+        }
+
+        const metadataResponse = await fetchWithTimeout(`${MOCHA_BASE}/api/shares/${encodeURIComponent(token)}`, {
+            method: "GET"
+        }, 15 * 1000).catch(() => null);
+
+        if (!metadataResponse?.ok) continue;
+
+        const metadata = await metadataResponse.json().catch(() => null);
+        const publicShare = metadata?.share ?? metadata;
+
+        if (isShareActive(publicShare) && shareMatchesFile(publicShare, filename, size, mimeType)) {
+            return { token, url: `${MOCHA_BASE}/share/${token}` };
+        }
+    }
+
+    return null;
 }
 
 async function uploadDirect(
@@ -593,12 +722,37 @@ export async function uploadToMocha(
 
     try {
         const destinationFolder = `/discord/${today()}`;
+        const resolvedMimeType = mimeType || "application/octet-stream";
+
+        setProgress(uploadKey, {
+            phase: "preparing",
+            percent: 1,
+            transferredBytes: 0,
+            totalBytes: fileBuffer.byteLength,
+            status: "Checking Mocha for an existing share..."
+        });
+
+        const existingShare = await findExistingShare(apiKey, filename, fileBuffer.byteLength, resolvedMimeType).catch(() => null);
+        if (existingShare) {
+            setProgress(uploadKey, {
+                phase: "success",
+                percent: 100,
+                transferredBytes: fileBuffer.byteLength,
+                totalBytes: fileBuffer.byteLength,
+                status: "Existing Mocha share found."
+            });
+
+            return {
+                success: true,
+                url: existingShare.url
+            };
+        }
 
         await ensureFolder(apiKey, destinationFolder);
 
         const fileId = fileBuffer.byteLength <= DIRECT_UPLOAD_LIMIT
-            ? await uploadDirect(uploadKey, apiKey, fileBuffer, filename, mimeType || "application/octet-stream", destinationFolder)
-            : await uploadMultipart(uploadKey, apiKey, fileBuffer, filename, mimeType || "application/octet-stream", destinationFolder);
+            ? await uploadDirect(uploadKey, apiKey, fileBuffer, filename, resolvedMimeType, destinationFolder)
+            : await uploadMultipart(uploadKey, apiKey, fileBuffer, filename, resolvedMimeType, destinationFolder);
 
         setProgress(uploadKey, {
             phase: "sharing",
@@ -653,12 +807,37 @@ export async function uploadPathToMocha(
 
     try {
         const destinationFolder = `/discord/${today()}`;
+        const resolvedMimeType = mimeType || "application/octet-stream";
+
+        setProgress(uploadKey, {
+            phase: "preparing",
+            percent: 1,
+            transferredBytes: 0,
+            totalBytes: fileStat.size,
+            status: "Checking Mocha for an existing share..."
+        });
+
+        const existingShare = await findExistingShare(apiKey, filename, fileStat.size, resolvedMimeType).catch(() => null);
+        if (existingShare) {
+            setProgress(uploadKey, {
+                phase: "success",
+                percent: 100,
+                transferredBytes: fileStat.size,
+                totalBytes: fileStat.size,
+                status: "Existing Mocha share found."
+            });
+
+            return {
+                success: true,
+                url: existingShare.url
+            };
+        }
 
         await ensureFolder(apiKey, destinationFolder);
 
         const fileId = fileStat.size <= DIRECT_UPLOAD_LIMIT
-            ? await uploadDirect(uploadKey, apiKey, toArrayBuffer(await readFile(filePath)), filename, mimeType || "application/octet-stream", destinationFolder)
-            : await uploadMultipartFromPath(uploadKey, apiKey, filePath, fileStat.size, filename, mimeType || "application/octet-stream", destinationFolder);
+            ? await uploadDirect(uploadKey, apiKey, toArrayBuffer(await readFile(filePath)), filename, resolvedMimeType, destinationFolder)
+            : await uploadMultipartFromPath(uploadKey, apiKey, filePath, fileStat.size, filename, resolvedMimeType, destinationFolder);
 
         setProgress(uploadKey, {
             phase: "sharing",
@@ -701,4 +880,19 @@ export async function cancelUpload(_: IpcMainInvokeEvent, uploadKey: string): Pr
         phase: "cancelled",
         status: "Upload cancelled."
     });
+}
+
+export async function chooseFilePath(_: IpcMainInvokeEvent): Promise<{ path: string; name: string; } | null> {
+    const result = await dialog.showOpenDialog({
+        properties: ["openFile"]
+    });
+
+    if (result.canceled || !result.filePaths.length) {
+        return null;
+    }
+
+    const path = result.filePaths[0];
+    const name = path.split(/[\\/]/).pop() || "upload.bin";
+
+    return { path, name };
 }
