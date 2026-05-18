@@ -30,6 +30,7 @@ Okay this is a different type of install.
 - Uploads to a folder, the stock being /Discord, then seperated in folders by date
 - Shows progress of upload in the Discord client
 - Auto sends the link once upload is complete
+- If files land under the standard max for Discord without Nitro it will just upload through Discord
 
 
 
