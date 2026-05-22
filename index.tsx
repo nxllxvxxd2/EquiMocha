@@ -624,7 +624,9 @@ async function uploadMultipart(fileBlob: Blob, filename: string, destinationFold
             originalName: filename,
             path: remotePath,
             size: fileBlob.size,
-            mimeType
+            mimeType,
+            strategy: "s3",
+            partSizeBytes: CHUNK_SIZE
         })
     });
 
@@ -632,8 +634,27 @@ async function uploadMultipart(fileBlob: Blob, filename: string, destinationFold
         throw new Error(`Multipart init failed: ${initResponse.status} ${await initResponse.text()}`);
     }
 
-    const session = await initResponse.json();
+    const initData = await initResponse.json();
+
+    if (initData.strategy !== "s3") {
+        throw new Error(`Expected S3 multipart strategy but server returned: ${initData.strategy}`);
+    }
+
+    const session = {
+        strategy: "s3" as const,
+        uploadId: String(initData.uploadId),
+        key: String(initData.key),
+        nodeId: String(initData.nodeId),
+        originalName: filename,
+        path: remotePath
+    };
+
+    if (!session.uploadId || !session.key || !session.nodeId) {
+        throw new Error(`Invalid multipart init response: ${JSON.stringify(initData)}`);
+    }
+
     const totalParts = Math.ceil(fileBlob.size / CHUNK_SIZE);
+    const parts: Array<{ partNumber: number; etag: string; }> = [];
     let totalUploaded = 0;
 
     for (let partNumber = 1; partNumber <= totalParts; partNumber++) {
@@ -653,21 +674,39 @@ async function uploadMultipart(fileBlob: Blob, filename: string, destinationFold
                         : `Retrying part ${partNumber}/${totalParts} via ${MOCHA_SERVICE_LABEL}...`
                 });
 
-                const partUrl = new URL(`${MOCHA_BASE}/api/files/multipart/part`);
-                partUrl.searchParams.set("strategy", String(session.strategy));
-                partUrl.searchParams.set("uploadId", String(session.uploadId));
-                partUrl.searchParams.set("key", String(session.key));
-                partUrl.searchParams.set("nodeId", String(session.nodeId));
-                partUrl.searchParams.set("originalName", filename);
-                partUrl.searchParams.set("path", remotePath);
-                partUrl.searchParams.set("partNumber", String(partNumber));
+                // Fetch presigned S3 URL for this part
+                const presignResponse = await fetchWithAbort(`${MOCHA_BASE}/api/files/multipart/presigned`, {
+                    method: "POST",
+                    headers: authHeaders({
+                        "Content-Type": "application/json"
+                    }),
+                    body: JSON.stringify({
+                        ...session,
+                        partNumbers: [partNumber],
+                        expiresInSeconds: 3600
+                    })
+                });
+
+                if (!presignResponse.ok) {
+                    throw new Error(`Presign part ${partNumber} failed: ${presignResponse.status} ${await presignResponse.text()}`);
+                }
+
+                const presignData = await presignResponse.json();
+                const presignedUrl: string | undefined =
+                    typeof presignData?.url === "string" ? presignData.url
+                    : typeof presignData?.presignedUrl === "string" ? presignData.presignedUrl
+                    : Array.isArray(presignData?.urls)
+                        ? presignData.urls.find((e: any) => e?.partNumber === partNumber)?.url
+                        : undefined;
+
+                if (!presignedUrl) {
+                    throw new Error(`No presigned URL returned for part ${partNumber}`);
+                }
 
                 let previousLoaded = 0;
-                const xhr = await uploadRequest(partUrl.toString(), {
+                const xhr = await uploadRequest(presignedUrl, {
                     method: "PUT",
-                    headers: authHeaders({
-                        "Content-Type": "application/octet-stream"
-                    }),
+                    headers: {},
                     body: chunk
                 }, event => {
                     if (!event.lengthComputable) return;
@@ -685,6 +724,12 @@ async function uploadMultipart(fileBlob: Blob, filename: string, destinationFold
                     });
                 });
 
+                const etag = xhr.getResponseHeader("ETag");
+                if (!etag) {
+                    throw new Error(`No ETag returned for part ${partNumber}`);
+                }
+
+                parts.push({ partNumber, etag });
                 break;
             } catch (error) {
                 if (attempt === PART_RETRIES) {
@@ -703,10 +748,9 @@ async function uploadMultipart(fileBlob: Blob, filename: string, destinationFold
         }),
         body: JSON.stringify({
             ...session,
-            originalName: filename,
-            path: remotePath,
             size: fileBlob.size,
-            mimeType
+            mimeType,
+            parts: parts.sort((a, b) => a.partNumber - b.partNumber)
         })
     });
 

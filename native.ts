@@ -498,8 +498,6 @@ async function uploadPart(
     completedBytes: number,
     totalBytes: number
 ): Promise<string> {
-    const directS3 = session.strategy === "s3" && session.directUploadEnabled !== false;
-
     for (let attempt = 1; attempt <= PART_RETRIES; attempt++) {
         getUploadSession(uploadKey);
 
@@ -513,30 +511,13 @@ async function uploadPart(
                     : `Retrying part ${partNumber}/${totalParts} via Mocha...`
             });
 
-            const requestUrl = directS3
-                ? await getPresignedPartUrl(apiKey, session, partNumber)
-                : (() => {
-                    const partUrl = new URL(`${MOCHA_BASE}/api/files/multipart/part`);
-                    partUrl.searchParams.set("strategy", String(session.strategy));
-                    partUrl.searchParams.set("uploadId", String(session.uploadId));
-                    partUrl.searchParams.set("key", String(session.key));
-                    partUrl.searchParams.set("nodeId", String(session.nodeId));
-                    partUrl.searchParams.set("originalName", String(session.originalName));
-                    partUrl.searchParams.set("path", String(session.path));
-                    partUrl.searchParams.set("partNumber", String(partNumber));
-                    return partUrl.toString();
-                })();
+            const presignedUrl = await getPresignedPartUrl(apiKey, session, partNumber);
 
             const uploadSession = getUploadSession(uploadKey);
-            const response = await fetchWithTimeout(requestUrl, {
+            const response = await fetchWithTimeout(presignedUrl, {
                 method: "PUT",
                 signal: uploadSession.controller.signal,
-                headers: directS3
-                    ? { "Content-Length": String(chunk.byteLength) }
-                    : authHeaders(apiKey, {
-                        "Content-Type": "application/octet-stream",
-                        "Content-Length": String(chunk.byteLength)
-                    }),
+                headers: { "Content-Length": String(chunk.byteLength) },
                 duplex: "half",
                 body: progressBody(chunk, loaded => {
                     const transferredBytes = Math.min(totalBytes, completedBytes + loaded);
@@ -558,9 +539,7 @@ async function uploadPart(
                 throw new Error(`Part ${partNumber} failed: ${response.status} ${await response.text()}`);
             }
 
-            const etag = directS3
-                ? response.headers.get("ETag")
-                : (await response.json()).etag ?? response.headers.get("ETag");
+            const etag = response.headers.get("ETag");
 
             if (!etag) {
                 throw new Error(`No ETag returned for part ${partNumber}`);
@@ -612,7 +591,8 @@ async function uploadMultipart(
             path: remotePath,
             size,
             mimeType,
-            partSizeBytes: CHUNK_SIZE
+            partSizeBytes: CHUNK_SIZE,
+            strategy: "s3"
         })
     }, 30 * 1000);
 
@@ -621,17 +601,21 @@ async function uploadMultipart(
     }
 
     const initData = await initResponse.json();
+
+    if (initData.strategy !== "s3") {
+        throw new Error(`Expected S3 multipart strategy but server returned: ${initData.strategy}`);
+    }
+
     const session = {
-        strategy: initData.strategy,
+        strategy: "s3" as const,
         uploadId: initData.uploadId,
         key: initData.key,
         nodeId: initData.nodeId,
         originalName: filename,
-        path: remotePath,
-        directUploadEnabled: initData.directUploadEnabled
+        path: remotePath
     };
 
-    if (!session.strategy || !session.uploadId || !session.key || !session.nodeId) {
+    if (!session.uploadId || !session.key || !session.nodeId) {
         throw new Error(`Invalid multipart init response: ${JSON.stringify(initData)}`);
     }
 
@@ -714,7 +698,8 @@ async function uploadMultipartFromPath(
             path: remotePath,
             size,
             mimeType,
-            partSizeBytes: CHUNK_SIZE
+            partSizeBytes: CHUNK_SIZE,
+            strategy: "s3"
         })
     }, 30 * 1000);
 
@@ -723,17 +708,21 @@ async function uploadMultipartFromPath(
     }
 
     const initData = await initResponse.json();
+
+    if (initData.strategy !== "s3") {
+        throw new Error(`Expected S3 multipart strategy but server returned: ${initData.strategy}`);
+    }
+
     const session = {
-        strategy: initData.strategy,
+        strategy: "s3" as const,
         uploadId: initData.uploadId,
         key: initData.key,
         nodeId: initData.nodeId,
         originalName: filename,
-        path: remotePath,
-        directUploadEnabled: initData.directUploadEnabled
+        path: remotePath
     };
 
-    if (!session.strategy || !session.uploadId || !session.key || !session.nodeId) {
+    if (!session.uploadId || !session.key || !session.nodeId) {
         throw new Error(`Invalid multipart init response: ${JSON.stringify(initData)}`);
     }
 
